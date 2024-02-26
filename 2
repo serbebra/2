@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract MultiSigConditionalWallet {
+    address public owner;
+    uint256 public numConfirmationsRequired;
+
+    struct Transaction {
+        address to;
+        uint256 value;
+        bytes data;
+        bool executed;
+        uint256 numConfirmations;
+        bool isConditional;
+        address conditionContract;
+        bytes conditionData;
+    }
+
+    mapping(uint256 => mapping(address => bool)) public isConfirmed;
+    mapping(uint256 => Transaction) public transactions;
+    uint256 public transactionCount;
+
+    event Deposit(address indexed sender, uint256 value);
+    event Submission(uint256 indexed transactionId);
+    event Confirmation(address indexed sender, uint256 indexed transactionId);
+    event Execution(uint256 indexed transactionId);
+    event ExecutionFailure(uint256 indexed transactionId);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+
+    modifier transactionExists(uint256 _transactionId) {
+        require(_transactionId < transactionCount, "Transaction does not exist");
+        _;
+    }
+
+    modifier notExecuted(uint256 _transactionId) {
+        require(!transactions[_transactionId].executed, "Transaction already executed");
+        _;
+    }
+
+    modifier notConfirmed(uint256 _transactionId) {
+        require(!isConfirmed[_transactionId][msg.sender], "Transaction already confirmed");
+        _;
+    }
+
+    constructor(address[] memory _owners, uint256 _numConfirmationsRequired) {
+        require(_owners.length > 0, "Owners required");
+        require(_numConfirmationsRequired > 0 && _numConfirmationsRequired <= _owners.length, "Invalid number of confirmations");
+
+        owner = msg.sender;
+        numConfirmationsRequired = _numConfirmationsRequired;
+    }
+
+    receive() external payable {
+        emit Deposit(msg.sender, msg.value);
+    }
+
+    function submitTransaction(address _to, uint256 _value, bytes memory _data) external returns (uint256) {
+        return _submitTransaction(_to, _value, _data, false, address(0), "");
+    }
+
+    function submitConditionalTransaction(address _to, uint256 _value, bytes memory _data, address _conditionContract, bytes memory _conditionData) external returns (uint256) {
+        return _submitTransaction(_to, _value, _data, true, _conditionContract, _conditionData);
+    }
+
+    function _submitTransaction(address _to, uint256 _value, bytes memory _data, bool _isConditional, address _conditionContract, bytes memory _conditionData) internal onlyOwner returns (uint256) {
+        uint256 transactionId = transactionCount;
+        transactions[transactionId] = Transaction({
+            to: _to,
+            value: _value,
+            data: _data,
+            executed: false,
+            numConfirmations: 0,
+            isConditional: _isConditional,
+            conditionContract: _conditionContract,
+            conditionData: _conditionData
+        });
+        transactionCount++;
+        emit Submission(transactionId);
+        return transactionId;
+    }
+
+    function confirmTransaction(uint256 _transactionId) external onlyOwner transactionExists(_transactionId) notExecuted(_transactionId) notConfirmed(_transactionId) {
+        _confirmTransaction(_transactionId);
+    }
+
+    function _confirmTransaction(uint256 _transactionId) internal {
+        Transaction storage transaction = transactions[_transactionId];
+        transaction.numConfirmations++;
+        isConfirmed[_transactionId][msg.sender] = true;
+        emit Confirmation(msg.sender, _transactionId);
+
+        if (transaction.numConfirmations >= numConfirmationsRequired) {
+            if (transaction.isConditional) {
+                (bool success, ) = transaction.conditionContract.call(transaction.conditionData);
+                if (success) {
+                    _executeTransaction(_transactionId);
+                } else {
+                    emit ExecutionFailure(_transactionId);
+                }
+            } else {
+                _executeTransaction(_transactionId);
+            }
+        }
+    }
+
+    function executeTransaction(uint256 _transactionId) external onlyOwner transactionExists(_transactionId) notExecuted(_transactionId) {
+        _executeTransaction(_transactionId);
+    }
+
+    function _executeTransaction(uint256 _transactionId) internal {
+        Transaction storage transaction = transactions[_transactionId];
+        (bool success, ) = transaction.to.call{value: transaction.value}(transaction.data);
+        if (success) {
+            transaction.executed = true;
+            emit Execution(_transactionId);
+        } else {
+            emit ExecutionFailure(_transactionId);
+        }
+    }
+
+    function revokeConfirmation(uint256 _transactionId) external onlyOwner transactionExists(_transactionId) notExecuted(_transactionId) {
+        Transaction storage transaction = transactions[_transactionId];
+        require(isConfirmed[_transactionId][msg.sender], "Transaction not confirmed by sender");
+        require(transaction.numConfirmations > 0, "No confirmations left to revoke");
+
+        transaction.numConfirmations--;
+        isConfirmed[_transactionId][msg.sender] = false;
+        emit Confirmation(msg.sender, _transactionId);
+    }
+
+    function changeOwner(address _newOwner)
